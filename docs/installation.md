@@ -408,6 +408,8 @@ claude mcp add semble -s user -- uvx --from "semble[mcp]" semble --content all
 
 Indexes stay in memory for the lifetime of the server. To free memory while idle, set `SEMBLE_MCP_IDLE_TIMEOUT` to a number of seconds; indexes unused for that long are dropped from memory and reloaded from the disk cache on the next search.
 
+The one-time embedding model download waits at most `SEMBLE_MCP_MODEL_LOAD_TIMEOUT` seconds (default 300) from the first search that needs the model; 0 or less disables the limit. If the Hub is unreachable rather than failing fast — a network-sandboxed agent, for example — a search returns an error after the limit instead of hanging forever. A slow download that outlives the limit errors its waiting call but keeps downloading, and later searches succeed once it finishes; raise the limit if your download legitimately takes longer.
+
 #### Shared server (HTTP)
 
 By default each agent session starts its own semble process. To share one server (and one copy of the model and indexes) across sessions, start it yourself over HTTP:

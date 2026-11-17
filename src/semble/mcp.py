@@ -33,6 +33,9 @@ _CACHE_IDLE_TIMEOUT = float(
     os.environ.get("SEMBLE_MCP_IDLE_TIMEOUT", 0)
 )  # Idle seconds before dropping an index (0 = never)
 _MIN_REVALIDATE_FACTOR = 3  # Don't recheck staleness sooner than this many times the last build's duration
+_MODEL_LOAD_TIMEOUT = float(
+    os.environ.get("SEMBLE_MCP_MODEL_LOAD_TIMEOUT", 300)
+)  # Seconds to wait for the one-time embedding model load before erroring (0 = never time out)
 ContentSelection = Literal["code", "docs", "config", "all"]
 _CacheKey = tuple[str, tuple[ContentType, ...]]
 
@@ -211,6 +214,7 @@ class _IndexCache:
         self._idle_timers: dict[_CacheKey, asyncio.TimerHandle] = {}
         self._model_path: str | None = None
         self._model_error: BaseException | None = None
+        self._model_deadline: float | None = None
         self._model_ready = asyncio.Event()
         self._tasks: OrderedDict[_CacheKey, asyncio.Task[SembleIndex]] = OrderedDict()  # ordered for LRU eviction
         self._revalidate_after: dict[_CacheKey, float] = {}
@@ -224,8 +228,33 @@ class _IndexCache:
         return self._merged[1]
 
     async def _await_model(self) -> str:
-        """Block until the model is installed; re-raise the load error if it failed."""
-        await self._model_ready.wait()
+        """Block until the model is installed; re-raise the load error if it failed.
+
+        The wait is bounded: when the Hub is unreachable the background load stalls inside a
+        network read that has no timeout of its own, and an unbounded wait would hang every
+        tool call forever with no error (seen with network-sandboxed agent subagents). The
+        deadline is latched on first call so retries do not each pay the full timeout; a
+        download that finishes after the deadline still serves the next call.
+        """
+        if self._model_error is not None:
+            raise self._model_error
+        if not self._model_ready.is_set():
+            if _MODEL_LOAD_TIMEOUT > 0:
+                if self._model_deadline is None:
+                    self._model_deadline = time.monotonic() + _MODEL_LOAD_TIMEOUT
+                try:
+                    await asyncio.wait_for(
+                        self._model_ready.wait(), timeout=max(0.0, self._model_deadline - time.monotonic())
+                    )
+                except asyncio.TimeoutError:
+                    raise RuntimeError(
+                        f"Could not load the embedding model within {_MODEL_LOAD_TIMEOUT:g} seconds. The one-time "
+                        "download from the Hugging Face Hub may be blocked or unreachable; check network access, or "
+                        "point SEMBLE_MODEL_NAME at a local model path. The download may still be in progress in the "
+                        "background; later calls succeed if it finishes."
+                    ) from None
+            else:
+                await self._model_ready.wait()
         if self._model_error is not None:
             raise self._model_error
         assert self._model_path is not None

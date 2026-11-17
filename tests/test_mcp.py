@@ -495,6 +495,56 @@ async def test_index_cache_propagates_model_error(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+async def test_await_model_times_out() -> None:
+    """_await_model raises a clear error instead of hanging forever when the model never loads."""
+    cache = _IndexCache()  # no _model_ready.set(): the load never completes
+    with patch("semble.mcp._MODEL_LOAD_TIMEOUT", 0.05):
+        with pytest.raises(RuntimeError, match="Could not load the embedding model within 0.05 seconds"):
+            await asyncio.wait_for(cache._await_model(), timeout=5.0)
+
+
+@pytest.mark.anyio
+async def test_await_model_latches_deadline() -> None:
+    """After a timeout, retries use the same deadline instead of each paying the full timeout again."""
+    cache = _IndexCache()
+    with patch("semble.mcp._MODEL_LOAD_TIMEOUT", 0.05):
+        with pytest.raises(RuntimeError, match="Could not load the embedding model"):
+            await asyncio.wait_for(cache._await_model(), timeout=5.0)
+        latched = cache._model_deadline
+        assert latched is not None
+        # Past the latched deadline, the second call errors immediately ...
+        with pytest.raises(RuntimeError, match="Could not load the embedding model"):
+            await asyncio.wait_for(cache._await_model(), timeout=5.0)
+        # ... without re-latching a fresh deadline.
+        assert cache._model_deadline is latched
+
+
+@pytest.mark.anyio
+async def test_await_model_recovers_after_late_load() -> None:
+    """A download that completes after the deadline still serves the next call."""
+    cache = _IndexCache()
+    with patch("semble.mcp._MODEL_LOAD_TIMEOUT", 0.05):
+        with pytest.raises(RuntimeError, match="Could not load the embedding model"):
+            await asyncio.wait_for(cache._await_model(), timeout=5.0)
+    cache._model_path = "/fake/model"
+    cache._model_ready.set()
+    assert await asyncio.wait_for(cache._await_model(), timeout=5.0) == "/fake/model"
+
+
+@pytest.mark.anyio
+async def test_await_model_zero_timeout_disables_bound() -> None:
+    """0 disables the limit entirely, like SEMBLE_MCP_IDLE_TIMEOUT: wait forever, never error."""
+    cache = _IndexCache()
+    with patch("semble.mcp._MODEL_LOAD_TIMEOUT", 0):
+        waiter = asyncio.create_task(cache._await_model())
+        await asyncio.sleep(0.01)
+        assert not waiter.done(), "with the limit disabled, _await_model must keep waiting for the model"
+        cache._model_path = "/fake/model"
+        cache._model_ready.set()
+        assert await asyncio.wait_for(waiter, timeout=5.0) == "/fake/model"
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     ("repo", "tool", "extra_args", "expected"),
     [
